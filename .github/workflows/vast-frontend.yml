@@ -52,10 +52,11 @@ on:
       env-scope:
         description: "staging => unrestricted vast lane. prod => caller must dual-run + compare manifests (v1 contract, see README)."
         required: false
-        type: string
+        type: choice
+        options:
+          - staging
+          - prod
         default: staging
-        # `choice` is not supported for workflow_call string inputs on all
-        # plans; validated in the build job instead (accepted: staging|prod).
       node-version:
         description: "Optional Node version for actions/setup-node (e.g. `22`). Empty = use whatever the runner has."
         required: false
@@ -89,15 +90,10 @@ jobs:
       artifact-name: ${{ steps.meta.outputs.artifact-name }}
       manifest-sha256: ${{ steps.manifest.outputs.manifest-sha256 }}
     steps:
-      - name: Validate env-scope
+      - name: env-scope=prod reminder
+        if: ${{ inputs.env-scope == 'prod' }}
         run: |
-          case "${{ inputs.env-scope }}" in
-            staging|prod) ;;
-            *) echo "::error::env-scope must be 'staging' or 'prod' (got '${{ inputs.env-scope }}')"; exit 1;;
-          esac
-          if [ "${{ inputs.env-scope }}" = "prod" ]; then
-            echo "::warning::env-scope=prod — per docs/vast-frontend-lanes.md, prod callers must invoke this lane twice and compare manifest-sha256 until a dual-lane variant exists, plus run the post-deploy bundle tripwire."
-          fi
+          echo "::warning::env-scope=prod — per docs/vast-frontend-lanes.md, prod callers must invoke this lane twice and compare manifest-sha256 until a dual-lane variant exists, plus run the post-deploy bundle tripwire."
 
       - uses: actions/checkout@v4
 
