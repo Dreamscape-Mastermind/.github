@@ -1,0 +1,209 @@
+# vast-frontend.yml — standard lane for building sasasasa-family
+# frontends on UNTRUSTED rented vast.ai runners.
+#
+# Spec: ogiste/ctrl-plane docs/vast-frontend-lanes.md
+# ("The standard lane — one reusable workflow").
+#
+# TRUST BOUNDARY — read before calling:
+#   * Vast runners are rented hardware we do not control. This workflow
+#     deliberately declares NO `secrets:` inputs and grants the job token
+#     `contents: read` only. The only credential on the box is the
+#     job-scoped GITHUB_TOKEN, which dies when the job ends.
+#   * Callers must NEVER pass secrets, env blobs, SSH keys, or registry
+#     credentials into install-cmd / build-cmd. Build-time public env
+#     (NEXT_PUBLIC_*, VITE_*) must come from GitHub *variables* (vars.*)
+#     or a public-only secret subset — never from PRODUCTION_*_ENV style
+#     blobs that mix public and private values.
+#   * The artifact is the payload: a malicious host can tamper it.
+#     env-scope=prod callers must mitigate (dual-lane digest compare,
+#     post-deploy tripwire) — see README-vast-frontend.md.
+#
+# LANE CONVENTION — load-bearing:
+#   Every job NAME in this file starts with `frontend-`. The lane-level
+#   allowlist in vast-runner-repos.conf matches job-name globs
+#   (`repo:frontend-*`), so renaming a job out of that prefix silently
+#   removes it from the vast lane.
+#
+#   Each vast job ends with an `if: always()` workspace wipe: the box is
+#   shared/rented, we leave nothing behind.
+
+name: vast-frontend
+
+on:
+  workflow_call:
+    inputs:
+      install-cmd:
+        description: "Dependency install command (e.g. `corepack pnpm install --frozen-lockfile`)"
+        required: true
+        type: string
+      build-cmd:
+        description: "Build command producing artifact-path (e.g. `pnpm build`)"
+        required: true
+        type: string
+      artifact-path:
+        description: "Path (relative to working-directory) holding the built artifact (e.g. `dist/`)"
+        required: true
+        type: string
+      e2e-port:
+        description: "If set, run the thin e2e smoke job: serve the artifact on this port and curl the root for 200. Unset/0 disables."
+        required: false
+        type: number
+        default: 0
+      env-scope:
+        description: "staging => unrestricted vast lane. prod => caller must dual-run + compare manifests (v1 contract, see README)."
+        required: false
+        type: string
+        default: staging
+        # `choice` is not supported for workflow_call string inputs on all
+        # plans; validated in the build job instead (accepted: staging|prod).
+      node-version:
+        description: "Optional Node version for actions/setup-node (e.g. `22`). Empty = use whatever the runner has."
+        required: false
+        type: string
+        default: ""
+      working-directory:
+        description: "Subdirectory of the checkout where install/build run and artifact-path is relative to."
+        required: false
+        type: string
+        default: "."
+      artifact-suffix:
+        description: "Optional suffix for the artifact name. Set distinct values (e.g. `lane-a`/`lane-b`) when a caller invokes this twice for the prod dual-lane digest compare."
+        required: false
+        type: string
+        default: ""
+    outputs:
+      artifact-name:
+        description: "Name of the uploaded Actions artifact (built payload + manifest.sha256)."
+        value: ${{ jobs.frontend-build.outputs.artifact-name }}
+      manifest-sha256:
+        description: "sha256 of the normalized per-file manifest (digest-of-manifest for dual-lane compare / tripwire)."
+        value: ${{ jobs.frontend-build.outputs.manifest-sha256 }}
+
+permissions:
+  contents: read   # the only grant on vast; no packages, no id-token, nothing else
+
+jobs:
+  frontend-build:
+    runs-on: [self-hosted, vast]
+    outputs:
+      artifact-name: ${{ steps.meta.outputs.artifact-name }}
+      manifest-sha256: ${{ steps.manifest.outputs.manifest-sha256 }}
+    steps:
+      - name: Validate env-scope
+        run: |
+          case "${{ inputs.env-scope }}" in
+            staging|prod) ;;
+            *) echo "::error::env-scope must be 'staging' or 'prod' (got '${{ inputs.env-scope }}')"; exit 1;;
+          esac
+          if [ "${{ inputs.env-scope }}" = "prod" ]; then
+            echo "::warning::env-scope=prod — per docs/vast-frontend-lanes.md, prod callers must invoke this lane twice and compare manifest-sha256 until a dual-lane variant exists, plus run the post-deploy bundle tripwire."
+          fi
+
+      - uses: actions/checkout@v4
+
+      - name: Set up Node
+        if: ${{ inputs.node-version != '' }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ inputs.node-version }}
+
+      - name: Artifact name
+        id: meta
+        run: |
+          suffix="${{ inputs.artifact-suffix }}"
+          name="frontend-${{ inputs.env-scope }}-${{ github.sha }}-${{ github.run_id }}${{ github.run_attempt > 1 && format('-attempt{0}', github.run_attempt) || '' }}${{ suffix != '' && format('-{0}', suffix) || '' }}"
+          echo "artifact-name=$name" >> "$GITHUB_OUTPUT"
+
+      - name: Install
+        working-directory: ${{ inputs.working-directory }}
+        run: ${{ inputs.install-cmd }}
+
+      - name: Build
+        working-directory: ${{ inputs.working-directory }}
+        run: ${{ inputs.build-cmd }}
+
+      - name: Generate normalized manifest
+        id: manifest
+        working-directory: ${{ inputs.working-directory }}
+        run: |
+          set -euo pipefail
+          ap="${{ inputs.artifact-path }}"
+          if [ ! -d "$ap" ]; then
+            echo "::error::artifact-path '$ap' not found after build"
+            exit 1
+          fi
+          out="$GITHUB_WORKSPACE/manifest.sha256"
+          # Normalized manifest, per the design doc:
+          #   * paths are relative to artifact-path (no absolute paths)
+          #   * file list is sorted (locale-pinned) before hashing
+          #   * each line is `sha256  relpath`; volatile line endings are
+          #     normalized before hashing file bodies
+          # v1 simplification: filename-embedded build hashes and
+          # in-bundle timestamps are NOT stripped — a nondeterministic
+          # builder will trip the dual-lane compare, which fails safe.
+          ( cd "$ap" \
+            && find . -type f -print0 \
+            | LC_ALL=C sort -z \
+            | while IFS= read -r -d '' f; do
+                h=$(sha256sum "$f" | cut -d' ' -f1)
+                printf '%s  %s\n' "$h" "${f#./}"
+              done ) > "$out"
+          digest=$(sha256sum "$out" | cut -d' ' -f1)
+          echo "manifest-sha256=$digest" >> "$GITHUB_OUTPUT"
+          echo "manifest ($out):"
+          cat "$out"
+          echo "manifest-sha256: $digest"
+
+      - name: Upload artifact + manifest
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.meta.outputs.artifact-name }}
+          path: |
+            ${{ inputs.working-directory }}/${{ inputs.artifact-path }}
+            manifest.sha256
+          if-no-files-found: error
+          retention-days: 14   # artifact is a lane-to-lane handoff, not an archive
+
+      - name: Wipe workspace (rented box)
+        if: always()
+        run: find "$GITHUB_WORKSPACE" -mindepth 1 -delete || true
+
+  frontend-e2e:
+    # Thin smoke check only — real Playwright/visual suites stay in the
+    # caller repos (proven lanes: vast-playwright on sasa-map + sites).
+    if: ${{ inputs.e2e-port != 0 }}
+    needs: frontend-build
+    runs-on: [self-hosted, vast]
+    steps:
+      - name: Download artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ needs.frontend-build.outputs.artifact-name }}
+          path: dist
+
+      - name: Serve artifact and smoke-check root
+        run: |
+          set -euo pipefail
+          port="${{ inputs.e2e-port }}"
+          if command -v python3 >/dev/null 2>&1; then
+            (cd dist && python3 -m http.server "$port" >/tmp/vast-e2e-server.log 2>&1 & echo $! > /tmp/vast-e2e-server.pid)
+          else
+            (cd dist && npx --yes http-server -p "$port" >/tmp/vast-e2e-server.log 2>&1 & echo $! > /tmp/vast-e2e-server.pid)
+          fi
+          ok=0
+          for i in $(seq 1 15); do
+            code=$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:$port/" || true)
+            if [ "$code" = "200" ]; then ok=1; break; fi
+            sleep 1
+          done
+          kill "$(cat /tmp/vast-e2e-server.pid)" 2>/dev/null || true
+          cat /tmp/vast-e2e-server.log || true
+          if [ "$ok" != "1" ]; then
+            echo "::error::served artifact did not return HTTP 200 on port $port (last code: ${code:-none})"
+            exit 1
+          fi
+          echo "smoke OK: http://127.0.0.1:$port/ -> 200"
+
+      - name: Wipe workspace (rented box)
+        if: always()
+        run: find "$GITHUB_WORKSPACE" -mindepth 1 -delete || true
